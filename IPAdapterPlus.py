@@ -192,7 +192,7 @@ def tensorToCV(image):
     out = np.stack(img, axis=0)
     return out
 
-class IPAdapter(nn.Module):
+class IPAdapter():
     def __init__(self, ipadapter_model, cross_attention_dim=1024, output_cross_attention_dim=1024, clip_embeddings_dim=1024, clip_extra_context_tokens=4, is_sdxl=False, is_plus=False, is_full=False, is_faceid=False):
         super().__init__()
 
@@ -211,7 +211,6 @@ class IPAdapter(nn.Module):
             self.image_proj_model = self.init_proj()
 
         self.image_proj_model.load_state_dict(ipadapter_model["image_proj"])
-        self.ip_layers = To_KV(ipadapter_model["ip_adapter"])
 
     def init_proj(self):
         image_proj_model = ImageProjModel(
@@ -249,16 +248,18 @@ class IPAdapter(nn.Module):
         return image_proj_model
 
     @torch.inference_mode()
-    def get_image_embeds(self, clip_embed, clip_embed_zeroed):
-        image_prompt_embeds = self.image_proj_model(clip_embed)
-        uncond_image_prompt_embeds = self.image_proj_model(clip_embed_zeroed)
+    def get_image_embeds(self, clip_embed, clip_embed_zeroed, device, dtype):
+        self.image_proj_model.to(device, dtype=dtype)
+        image_prompt_embeds = self.image_proj_model(clip_embed.to(device, dtype=dtype))
+        uncond_image_prompt_embeds = self.image_proj_model(clip_embed_zeroed.to(device, dtype=dtype))
+        del self.image_proj_model  # free GPU memory
         return image_prompt_embeds, uncond_image_prompt_embeds
 
 class CrossAttentionPatch:
     # forward for patching
-    def __init__(self, weight, ipadapter, number, cond, uncond, weight_type, mask=None, sigma_start=0.0, sigma_end=1.0, unfold_batch=False):
+    def __init__(self, weight, ip_layers, number, cond, uncond, weight_type, mask=None, sigma_start=0.0, sigma_end=1.0, unfold_batch=False):
         self.weights = [weight]
-        self.ipadapters = [ipadapter]
+        self.ip_layers = [ip_layers]
         self.conds = [cond]
         self.unconds = [uncond]
         self.number = number
@@ -270,10 +271,11 @@ class CrossAttentionPatch:
 
         self.k_key = str(self.number*2+1) + "_to_k_ip"
         self.v_key = str(self.number*2+1) + "_to_v_ip"
+        self.current_device = cond.device
     
-    def set_new_condition(self, weight, ipadapter, number, cond, uncond, weight_type, mask=None, sigma_start=0.0, sigma_end=1.0, unfold_batch=False):
+    def set_new_condition(self, weight, ip_layers, number, cond, uncond, weight_type, mask=None, sigma_start=0.0, sigma_end=1.0, unfold_batch=False):
         self.weights.append(weight)
-        self.ipadapters.append(ipadapter)
+        self.ip_layers.append(ip_layers)
         self.conds.append(cond)
         self.unconds.append(uncond)
         self.masks.append(mask)
@@ -281,6 +283,19 @@ class CrossAttentionPatch:
         self.sigma_start.append(sigma_start)
         self.sigma_end.append(sigma_end)
         self.unfold_batch.append(unfold_batch)
+
+    def to(self, device_or_dtype):
+        ''' move to device or convert to dtype '''
+        if not isinstance(device_or_dtype, torch.device): # ignore dtype conversions
+            return self
+        dtype = torch.float16 if comfy.model_management.should_use_fp16() else torch.float32
+        for i in range(len(self.conds)):
+            self.conds[i] = self.conds[i].to(device_or_dtype, dtype=dtype)
+            self.unconds[i] = self.unconds[i].to(device_or_dtype, dtype=dtype)
+            if self.masks[i] is not None:
+              self.masks[i] = self.masks[i].to(device_or_dtype, dtype=dtype)
+            self.ip_layers[i] = self.ip_layers[i].to(device_or_dtype, dtype=dtype)
+        return self
 
     def __call__(self, n, context_attn2, value_attn2, extra_options):
         org_dtype = n.dtype
@@ -299,10 +314,9 @@ class CrossAttentionPatch:
         out = optimized_attention(q, k, v, extra_options["n_heads"])
         _, _, lh, lw = extra_options["original_shape"]
         
-        for weight, cond, uncond, ipadapter, mask, weight_type, sigma_start, sigma_end, unfold_batch in zip(self.weights, self.conds, self.unconds, self.ipadapters, self.masks, self.weight_type, self.sigma_start, self.sigma_end, self.unfold_batch):
+        for weight, cond, uncond, ip_layers, mask, weight_type, sigma_start, sigma_end, unfold_batch in zip(self.weights, self.conds, self.unconds, self.ip_layers, self.masks, self.weight_type, self.sigma_start, self.sigma_end, self.unfold_batch):
             if sigma > sigma_start or sigma < sigma_end:
                 continue
-
             if unfold_batch and cond.shape[0] > 1:
                 # Check AnimateDiff context window
                 if ad_params is not None and ad_params["sub_idxs"] is not None:
@@ -332,15 +346,15 @@ class CrossAttentionPatch:
                     cond = cond[:batch_prompt]
                     uncond = uncond[:batch_prompt]
 
-                k_cond = ipadapter.ip_layers.to_kvs[self.k_key](cond)
-                k_uncond = ipadapter.ip_layers.to_kvs[self.k_key](uncond)
-                v_cond = ipadapter.ip_layers.to_kvs[self.v_key](cond)
-                v_uncond = ipadapter.ip_layers.to_kvs[self.v_key](uncond)
+                k_cond = ip_layers.to_kvs[self.k_key](cond)
+                k_uncond = ip_layers.to_kvs[self.k_key](uncond)
+                v_cond = ip_layers.to_kvs[self.v_key](cond)
+                v_uncond = ip_layers.to_kvs[self.v_key](uncond)
             else:
-                k_cond = ipadapter.ip_layers.to_kvs[self.k_key](cond).repeat(batch_prompt, 1, 1)
-                k_uncond = ipadapter.ip_layers.to_kvs[self.k_key](uncond).repeat(batch_prompt, 1, 1)
-                v_cond = ipadapter.ip_layers.to_kvs[self.v_key](cond).repeat(batch_prompt, 1, 1)
-                v_uncond = ipadapter.ip_layers.to_kvs[self.v_key](uncond).repeat(batch_prompt, 1, 1)
+                k_cond = ip_layers.to_kvs[self.k_key](cond).repeat(batch_prompt, 1, 1)
+                k_uncond = ip_layers.to_kvs[self.k_key](uncond).repeat(batch_prompt, 1, 1)
+                v_cond = ip_layers.to_kvs[self.v_key](cond).repeat(batch_prompt, 1, 1)
+                v_uncond = ip_layers.to_kvs[self.v_key](uncond).repeat(batch_prompt, 1, 1)
 
             if weight_type.startswith("linear"):
                 ip_k = torch.cat([(k_cond, k_uncond)[i] for i in cond_or_uncond], dim=0) * weight
@@ -489,24 +503,24 @@ class IPAdapterApply:
     CATEGORY = "ipadapter"
 
     def apply_ipadapter(self, ipadapter, model, weight, clip_vision=None, image=None, weight_type="original", noise=None, embeds=None, attn_mask=None, start_at=0.0, end_at=1.0, unfold_batch=False):
-        self.dtype = torch.float16 if comfy.model_management.should_use_fp16() else torch.float32
-        self.device = comfy.model_management.get_torch_device()
-        self.weight = weight
-        self.is_full = "proj.0.weight" in ipadapter["image_proj"]
-        self.is_faceid = "0.to_q_lora.down.weight" in ipadapter["ip_adapter"] # TODO: better way to detect faceid?
-        self.is_plus = (self.is_full or "latents" in ipadapter["image_proj"]) and not self.is_faceid
+        dtype = torch.float16 if comfy.model_management.should_use_fp16() else torch.float32
+        device = comfy.model_management.get_torch_device()
+        weight = weight
+        is_full = "proj.0.weight" in ipadapter["image_proj"]
+        is_faceid = "0.to_q_lora.down.weight" in ipadapter["ip_adapter"] # TODO: better way to detect faceid?
+        is_plus = (is_full or "latents" in ipadapter["image_proj"]) and not is_faceid
 
         output_cross_attention_dim = ipadapter["ip_adapter"]["1.to_k_ip.weight"].shape[1]
-        self.is_sdxl = output_cross_attention_dim == 2048
-        cross_attention_dim = 1280 if self.is_plus and self.is_sdxl else output_cross_attention_dim
-        clip_extra_context_tokens = 16 if self.is_plus else 4
+        is_sdxl = output_cross_attention_dim == 2048
+        cross_attention_dim = 1280 if is_plus and is_sdxl else output_cross_attention_dim
+        clip_extra_context_tokens = 16 if is_plus else 4
 
         if embeds is not None:
             embeds = torch.unbind(embeds)
             clip_embed = embeds[0].cpu()
             clip_embed_zeroed = embeds[1].cpu()
         else:
-            if self.is_faceid:
+            if is_faceid:
                 clip_embed = clip_vision.get(tensorToCV(image)) # TODO: support multiple images (is it needed?)
                 if not clip_embed:
                     print("\033[33mWARNING!!! InsightFace wasn't able to detect the face. Try to use the PrepImageForInsightFace node.\033[0m")
@@ -521,7 +535,7 @@ class IPAdapterApply:
                 clip_embed = clip_vision.encode_image(image)
                 neg_image = image_add_noise(image, noise) if noise > 0 else None
                 
-                if self.is_plus:
+                if is_plus:
                     clip_embed = clip_embed.penultimate_hidden_states
                     if noise > 0:
                         clip_embed_zeroed = clip_vision.encode_image(neg_image).penultimate_hidden_states
@@ -536,36 +550,37 @@ class IPAdapterApply:
 
         clip_embeddings_dim = clip_embed.shape[-1]
 
-        self.ipadapter = IPAdapter(
+        ipadapter_inst = IPAdapter(
             ipadapter,
             cross_attention_dim=cross_attention_dim,
             output_cross_attention_dim=output_cross_attention_dim,
             clip_embeddings_dim=clip_embeddings_dim,
             clip_extra_context_tokens=clip_extra_context_tokens,
-            is_sdxl=self.is_sdxl,
-            is_plus=self.is_plus,
-            is_full=self.is_full,
-            is_faceid=self.is_faceid,
+            is_sdxl=is_sdxl,
+            is_plus=is_plus,
+            is_full=is_full,
+            is_faceid=is_faceid,
         )
-        
-        self.ipadapter.to(self.device, dtype=self.dtype)
-
-        image_prompt_embeds, uncond_image_prompt_embeds = self.ipadapter.get_image_embeds(clip_embed.to(self.device, dtype=self.dtype), clip_embed_zeroed.to(self.device, dtype=self.dtype))
-        image_prompt_embeds = image_prompt_embeds.to(self.device, dtype=self.dtype)
-        uncond_image_prompt_embeds = uncond_image_prompt_embeds.to(self.device, dtype=self.dtype)
-
-        work_model = model.clone()
-
-        if attn_mask is not None:
-            attn_mask = attn_mask.to(self.device)
 
         sigma_start = model.model.model_sampling.percent_to_sigma(start_at)
         sigma_end = model.model.model_sampling.percent_to_sigma(end_at)
 
+        image_prompt_embeds, uncond_image_prompt_embeds = ipadapter_inst.get_image_embeds(clip_embed, clip_embed_zeroed, device, dtype)
+        
+        # offload to CPU memory
+        image_prompt_embeds = image_prompt_embeds.to(model.offload_device, dtype=dtype)
+        uncond_image_prompt_embeds = uncond_image_prompt_embeds.to(model.offload_device, dtype=dtype)
+
+        del ipadapter_inst
+
+        if attn_mask is not None:
+            attn_mask = attn_mask.to(model.offload_device)
+
+        ip_layers = To_KV(ipadapter["ip_adapter"])
         patch_kwargs = {
             "number": 0,
-            "weight": self.weight,
-            "ipadapter": self.ipadapter,
+            "weight": weight,
+            "ip_layers": ip_layers,
             "cond": image_prompt_embeds,
             "uncond": uncond_image_prompt_embeds,
             "weight_type": weight_type,
@@ -575,7 +590,9 @@ class IPAdapterApply:
             "unfold_batch": unfold_batch,
         }
 
-        if not self.is_sdxl:
+        work_model = model.clone()
+
+        if not is_sdxl:
             for id in [1,2,4,5,7,8]: # id of input_blocks that have cross attention
                 set_model_patch_replace(work_model, patch_kwargs, ("input", id))
                 patch_kwargs["number"] += 1
