@@ -102,7 +102,7 @@ def set_model_patch_replace(model, patch_kwargs, key):
 
 def image_add_noise(image, noise):
     image = image.permute([0,3,1,2])
-    torch.manual_seed(0) # use a fixed random for reproducible results
+    torch.manual_seed(8) # use a fixed random for reproducible results
     transforms = TT.Compose([
         TT.CenterCrop(min(image.shape[2], image.shape[3])),
         TT.Resize((224, 224), interpolation=TT.InterpolationMode.BICUBIC, antialias=True),
