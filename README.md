@@ -5,6 +5,12 @@ IPAdapter implementation that follows the ComfyUI way of doing things. The code 
 
 ## Important updates
 
+**2024/01/16**: Notably increased quality of FaceID Plus/v2 models. Check the [comparison](https://github.com/cubiq/ComfyUI_IPAdapter_plus/issues/195) of all face models.
+
+**2023/12/30**: Added support for FaceID Plus v2 models. **Important:** this update again breaks the previous implementation. This time I had to make a new node just for FaceID. The base `IPAdapter Apply` node will work with all previous models; for all FaceID models you'll find an `IPAdapter Apply FaceID` node. **When using v2 remember to check the `v2` options otherwise it won't work as expected!** As always the examples directory is full of workflows for you to play with.
+
+**2023/12/28**: Added support for FaceID Plus models. **Important:** this update breaks the previous implementation of FaceID. Check the updated workflows in the example directory! Remember to refresh the browser ComfyUI page to clear up the local cache.
+
 **2023/12/22**: Added support for FaceID models. [Read the documentation](#faceid) for details.
 
 **2023/12/05**: Added `batch embeds` node. This lets you encode images in batches and merge them together into an `IPAdapter Apply Encoded` node. Useful mostly for animations because the clip vision encoder takes a lot of VRAM. My suggestion is to split the animation in batches of about 120 frames.
@@ -18,10 +24,6 @@ IPAdapter implementation that follows the ComfyUI way of doing things. The code 
 **2023/11/23**: Small but important update: the new default location for the IPAdapter models is `ComfyUI/models/ipadapter`. **No panic**: the legacy `ComfyUI/custom_nodes/ComfyUI_IPAdapter_plus/models` location still works and nothing will break.
 
 **2023/11/08**: Added [attention masking](#attention-masking).
-
-**2023/11/07**: Added three ways to apply the weight. [See below](#weight-types) for more info. **This might break things!** Please let me know if you are having issues. When loading an old workflow try to reload the page a couple of times or delete the `IPAdapter Apply` node and insert a new one.
-
-**2023/11/02**: Added compatibility with the new models in safetensors format (available on [huggingface](https://huggingface.co/h94/IP-Adapter)).
 
 *(previous updates removed for better readability)*
 
@@ -57,12 +59,12 @@ The pre-trained models are available on [huggingface](https://huggingface.co/h94
 
 IPAdapter also needs the image encoders. You need the [CLIP-**ViT-H**-14-laion2B-s32B-b79K](https://huggingface.co/h94/IP-Adapter/resolve/main/models/image_encoder/model.safetensors) and [CLIP-**ViT-bigG**-14-laion2B-39B-b160k](https://huggingface.co/h94/IP-Adapter/resolve/main/sdxl_models/image_encoder/model.safetensors) image encoders, you may already have them. If you don't, download them but **be careful because the file name is the same!** Rename them to something easy to remember and place them in the `ComfyUI/models/clip_vision/` directory.
 
-The following table shows the combination of Checkpoint and Image encoder to use for each IPAdapter Model. Any Tensor size error you may get it is likely caused by a wrong combination.
+The following table shows the combination of Checkpoint and Image encoder to use for each IPAdapter Model. Any Tensor size mismatch you may get it is likely caused by a wrong combination.
 
-| SD v. | IPadapter | Img encoder | Nodes |
+| SD v. | IPadapter | Img encoder | Notes |
 |---|---|---|---|
 | v1.5 | [ip-adapter_sd15](https://huggingface.co/h94/IP-Adapter/resolve/main/models/ip-adapter_sd15.safetensors) | ViT-H | Basic model, average strength |
-| v1.5 | [ip-adapter_sd15_light](https://huggingface.co/h94/IP-Adapter/blob/main/models/ip-adapter_sd15_light.safetensors) | ViT-H | Light model, very light impact |
+| v1.5 | [ip-adapter_sd15_light](https://huggingface.co/h94/IP-Adapter/resolve/main/models/ip-adapter_sd15_light.safetensors) | ViT-H | Light model, very light impact |
 | v1.5 | [ip-adapter-plus_sd15](https://huggingface.co/h94/IP-Adapter/resolve/main/models/ip-adapter-plus_sd15.safetensors) | ViT-H | Plus model, very strong |
 | v1.5 | [ip-adapter-plus-face_sd15](https://huggingface.co/h94/IP-Adapter/resolve/main/models/ip-adapter-plus-face_sd15.safetensors) | ViT-H | Face model, use only for faces |
 | v1.5 | [ip-adapter-full-face_sd15](https://huggingface.co/h94/IP-Adapter/resolve/main/models/ip-adapter-full-face_sd15.safetensors) | ViT-H | Strongher face model, not necessarily better |
@@ -72,14 +74,21 @@ The following table shows the combination of Checkpoint and Image encoder to use
 | SDXL | [ip-adapter-plus_sdxl_vit-h](https://huggingface.co/h94/IP-Adapter/resolve/main/sdxl_models/ip-adapter-plus_sdxl_vit-h.safetensors) | ViT-H | SDXL plus model, stronger |
 | SDXL | [ip-adapter-plus-face_sdxl_vit-h](https://huggingface.co/h94/IP-Adapter/resolve/main/sdxl_models/ip-adapter-plus-face_sdxl_vit-h.safetensors) | ViT-H | SDXL face model |
 
-**FaceID** requires `insightface` and `onnxruntime`, you need to install them in your ComfyUI environment with `pip`, it's also a good idea to try to upgrade them with `pip install --upgrade ...`.
+**FaceID** requires `insightface`, you need to install them in your ComfyUI environment. Check [this issue](https://github.com/cubiq/ComfyUI_IPAdapter_plus/issues/162) for help.
 
 When the dependencies are satisfied you need:
 
-- The [main SD1.5 model](https://huggingface.co/h94/IP-Adapter-FaceID/resolve/main/ip-adapter-faceid_sd15.bin) to be placed into the ipadapter models directory.
-- The [Lora](https://huggingface.co/h94/IP-Adapter-FaceID/resolve/main/ip-adapter-faceid_sd15_lora.safetensors) to be planced into `ComfyUI/models/loras/` directory.
+| SD v. | IPadapter | Img encoder | Lora |
+|---|---|---|---|
+| v1.5 | [FaceID](https://huggingface.co/h94/IP-Adapter-FaceID/resolve/main/ip-adapter-faceid_sd15.bin) | (not used¹) | [FaceID Lora](https://huggingface.co/h94/IP-Adapter-FaceID/resolve/main/ip-adapter-faceid_sd15_lora.safetensors) |
+| v1.5 | [FaceID Plus](https://huggingface.co/h94/IP-Adapter-FaceID/resolve/main/ip-adapter-faceid-plus_sd15.bin) | ViT-H | [FaceID Plus Lora](https://huggingface.co/h94/IP-Adapter-FaceID/resolve/main/ip-adapter-faceid-plus_sd15_lora.safetensors) |
+| v1.5 | [FaceID Plus v2](https://huggingface.co/h94/IP-Adapter-FaceID/resolve/main/ip-adapter-faceid-plusv2_sd15.bin) | ViT-H | [FaceID Plus v2 Lora](https://huggingface.co/h94/IP-Adapter-FaceID/resolve/main/ip-adapter-faceid-plusv2_sd15_lora.safetensors) |
+| SDXL | [FaceID](https://huggingface.co/h94/IP-Adapter-FaceID/resolve/main/ip-adapter-faceid_sdxl.bin) | (not used¹) | [FaceID SDXL Lora](https://huggingface.co/h94/IP-Adapter-FaceID/resolve/main/ip-adapter-faceid_sdxl_lora.safetensors) |
 
-**There is no SDXL model at the moment.**
+
+¹ The base FaceID model doesn't make use of a CLIP vision encoder. Remember to pair any FaceID model together with any other Face model to make it more effective.
+
+The loras need to be placed into `ComfyUI/models/loras/` directory.
 
 ## How to
 
@@ -162,8 +171,6 @@ The image below shows the difference (zoom in).
 <img src="./examples/weight_types.jpg" width="100%" alt="weight types" />
 
 In the examples directory you can find [a workflow](examples/IPAdapter_weight_types.json) that lets you easily compare the three methods.
-
-**Note:** I'm not still sure whether all methods will stay. `Linear` seems the most sensible but I wanted to keep the `original` for backward compatibility. `channel penalty` has a weird non-commercial clause but it's still part of a GNU GPLv3 software (ie: there's a licensing clash) so I'm trying to understand how to deal with that.
 
 ### Attention masking
 
